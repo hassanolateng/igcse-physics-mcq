@@ -1,7 +1,7 @@
 """
 mcq_engine.py - Core Engine for Cambridge IGCSE Physics Paper 2 (MCQ) Auto-Grader
 Supports:
-1. Cambridge OMR / Bubble answer sheets (horizontal shaded lozenges under A/B/C/D)
+1. Cambridge OMR / Bubble answer sheets (Dual-column high-precision parallel scanner)
 2. Circled / marked exam question papers
 3. Handwritten notebook paper answers (e.g., '1. A, 2. B, 3. C...')
 """
@@ -11,6 +11,8 @@ import io
 import json
 import re
 import datetime
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple
 from PIL import Image
 import pymupdf
@@ -126,10 +128,77 @@ def robust_json_loads(raw_text: str) -> Dict[str, Any]:
                 pass
         raise ValueError(f"Could not parse valid JSON from AI response:\n{text[:300]}...")
 
+def _try_parallel_cambridge_bubble_sheet(client, img: Image.Image, model_name: str) -> Dict[str, Any]:
+    """
+    High-precision parallel scanner for Cambridge Supplementary Answer Sheets.
+    Crops Left Column (Q1-20) and Right Column (Q21-40) separately to completely
+    eliminate row drift and misalignments.
+    """
+    w, h = img.size
+    col1 = img.crop((int(w * 0.30), int(h * 0.34), int(w * 0.59), int(h * 0.91)))
+    col2 = img.crop((int(w * 0.59), int(h * 0.34), int(w * 0.88), int(h * 0.91)))
+
+    p1 = """You are reading Questions 1 to 20 on a Cambridge Multiple Choice Answer Sheet.
+There are 20 rows (numbered 1 to 20).
+In each row, options are A, B, C, D, E, F, G, H.
+Directly UNDERNEATH each letter is a small horizontal rectangular box [__].
+The candidate answered by darkening the horizontal box UNDER their chosen letter (A, B, C, or D).
+Ignore options E, F, G, H.
+If no box is filled in a row, write "BLANK".
+
+Return strictly a JSON object: {"1": "B", "2": "C", ... "20": "C"}"""
+
+    p2 = """You are reading Questions 21 to 40 on a Cambridge Multiple Choice Answer Sheet.
+There are 20 rows (numbered 21 to 40).
+In each row, options are A, B, C, D, E, F, G, H.
+Directly UNDERNEATH each letter is a small horizontal rectangular box [__].
+The candidate answered by darkening the horizontal box UNDER their chosen letter (A, B, C, or D).
+Ignore options E, F, G, H.
+If no box is filled in a row, write "BLANK".
+
+Return strictly a JSON object: {"21": "A", "22": "D", ... "40": "B"}"""
+
+    def fetch_col(p, crop_img):
+        res = client.models.generate_content(
+            model=model_name,
+            contents=[p, crop_img],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0
+            )
+        )
+        return robust_json_loads(res.text)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(fetch_col, p1, col1)
+        f2 = executor.submit(fetch_col, p2, col2)
+        res1 = f1.result()
+        res2 = f2.result()
+
+    merged = {**res1, **res2}
+
+    # Validate that we got a substantial number of questions
+    if len(merged) >= 30:
+        cleaned_answers = {}
+        for q in range(1, 41):
+            val = str(merged.get(str(q), merged.get(q, "BLANK"))).strip().upper()
+            if val in ["A", "B", "C", "D"]:
+                cleaned_answers[str(q)] = val
+            else:
+                cleaned_answers[str(q)] = "BLANK"
+
+        return {
+            "detected_format": "bubble_sheet",
+            "total_questions_detected": 40,
+            "answers": cleaned_answers,
+            "notes": "Processed via Cambridge dual-column high-precision scanner."
+        }
+    raise ValueError("Not enough answers found via dual-column crop.")
+
 def extract_answers_with_vision(images: List[Image.Image], exam_title: str = "") -> Dict[str, Any]:
     """
     Send the student's answer sheet/paper images to Gemini Vision.
-    Extracts answers 1 through 40 with specialized high-resolution zoom on Cambridge OMR columns.
+    Extracts answers 1 through 40.
     """
     if not images:
         raise ValueError("No valid images provided for answer extraction.")
@@ -139,41 +208,37 @@ def extract_answers_with_vision(images: List[Image.Image], exam_title: str = "")
         raise ValueError("No GEMINI_API_KEY configured. Please check config.py or Streamlit Secrets.")
 
     client = genai.Client(api_key=api_key)
+    model_name = getattr(config, "DEFAULT_MODEL", "gemini-3.5-flash-lite")
 
-    # Check if this might be a Cambridge bubble sheet (single page format with 2 columns)
-    content_payload = []
-    
+    # Fast-path: Single portrait page (Cambridge Answer Sheet optimization)
+    if len(images) == 1:
+        img = images[0]
+        if img.height > img.width:
+            try:
+                return _try_parallel_cambridge_bubble_sheet(client, img, model_name)
+            except Exception as e:
+                print(f"Dual-column scan fallback: {e}")
+
+    # Standard general-purpose Vision prompt for exam papers & notebooks
     prompt = f"""You are an expert Cambridge IGCSE examination optical reader.
 Your task is to examine the provided images of a student's solved exam and extract the candidate's chosen answer (A, B, C, or D) for every question from Question 1 through Question 40.
 
 Target Exam: {exam_title if exam_title else "Cambridge IGCSE Physics 0625 Paper 2 (40 Questions)"}
 
-DETAILED FORMAT GUIDELINES:
-
-FORMAT 1: CAMBRIDGE SUPPLEMENTARY MULTIPLE-CHOICE ANSWER SHEET (OMR / BUBBLE SHEET)
-- Two columns: Questions 1 to 20 are in the LEFT column; Questions 21 to 40 are in the RIGHT column.
-- Each row contains letters: A B C D E F G H.
-- Directly UNDERNEATH each letter is a small horizontal rectangular box [__].
-- The candidate answers by filling or darkening the horizontal rectangular box UNDER their chosen letter (A, B, C, or D).
-- IMPORTANT: Cambridge IGCSE exams only use options A, B, C, and D. Columns E, F, G, H are unused and MUST BE IGNORED.
-- Carefully determine which letter (A, B, C, or D) has the darkened/black horizontal mark in the box directly below it.
-- If a row has NO box shaded (e.g. Question 40 is completely empty), mark it as "BLANK".
-
-FORMAT 2: CIRCLED QUESTION PAPER
-- The candidate circled, boxed, or underlined option A, B, C, or D on the question paper.
-- If an option was crossed out and another chosen, take the final intended answer.
-
-FORMAT 3: HANDWRITTEN NOTEBOOK
-- The student wrote numbers and letters (e.g. "1. B, 2. A, 3. C...").
+THE SUBMISSION MAY BE IN ONE OF THREE FORMATS:
+1. CIRCLED / MARKED QUESTION PAPER: The candidate circled, boxed, or underlined option A, B, C, or D.
+2. BUBBLE / OMR SHEET: Filled bubbles or shaded boxes for options A, B, C, D.
+3. HANDWRITTEN NOTEBOOK: Student wrote numbers and letters (e.g. "1. B, 2. A, 3. C...").
 
 CRITICAL EXTRACTION RULES:
 - Output an answer for EVERY question from 1 to 40.
 - Output MUST strictly be single uppercase letters: "A", "B", "C", or "D" (or "BLANK" if unattempted).
+- If an option was crossed out and another written/chosen, take the final intended choice.
 
 OUTPUT FORMAT:
 Return strictly a valid JSON object matching this exact structure:
 {{
-  "detected_format": "bubble_sheet | circled_exam | handwritten_notebook",
+  "detected_format": "circled_exam | bubble_sheet | handwritten_notebook",
   "total_questions_detected": 40,
   "answers": {{
     "1": "A",
@@ -182,38 +247,24 @@ Return strictly a valid JSON object matching this exact structure:
     ...
     "40": "D"
   }},
-  "notes": "Brief notes on any unclear markings"
+  "notes": "Brief notes"
 }}
 """
-    content_payload.append(prompt)
 
-    # Add images and high-resolution crops if single-page sheet
-    for img in images:
-        content_payload.append(img)
-        w, h = img.size
-        # If it looks like a full page (portrait aspect ratio), also provide close-up crops of both columns
-        if h > w and len(images) == 1:
-            try:
-                col1 = img.crop((int(w * 0.30), int(h * 0.34), int(w * 0.59), int(h * 0.91)))
-                col2 = img.crop((int(w * 0.59), int(h * 0.34), int(w * 0.88), int(h * 0.91)))
-                content_payload.append("CLOSE-UP CROP OF LEFT COLUMN (Questions 1 to 20):")
-                content_payload.append(col1)
-                content_payload.append("CLOSE-UP CROP OF RIGHT COLUMN (Questions 21 to 40):")
-                content_payload.append(col2)
-            except Exception:
-                pass
+    contents = [prompt]
+    contents.extend(images)
 
     models_to_try = [
-        getattr(config, "DEFAULT_MODEL", "gemini-3.5-flash-lite"),
+        model_name,
         "gemini-3.8-flash"
     ]
 
     last_err = None
-    for model_name in models_to_try:
+    for m in models_to_try:
         try:
             response = client.models.generate_content(
-                model=model_name,
-                contents=content_payload,
+                model=m,
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.0
@@ -236,7 +287,7 @@ Return strictly a valid JSON object matching this exact structure:
 
         except Exception as e:
             last_err = e
-            print(f"Model {model_name} extraction failed: {e}. Trying fallback...")
+            print(f"Model {m} extraction failed: {e}. Trying fallback...")
 
     raise RuntimeError(f"All Gemini models failed to extract answers. Error: {last_err}")
 
