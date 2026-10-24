@@ -1,7 +1,7 @@
 """
-mcq_app.py - Student Web Application for Cambridge IGCSE Physics Paper 2 (MCQ)
+streamlit_app.py - Student Web Application for Cambridge IGCSE Physics Paper 2 (MCQ)
 Port: 8502
-Teacher Dashboard is protected behind a PIN code so students never see it.
+Engine Version: 1.2 (Dual-Column Precision Scanner)
 """
 
 import streamlit as st
@@ -172,6 +172,7 @@ with col_right:
                         extraction = mcq_engine.extract_answers_with_vision(images, exam_title=selected_exam_name)
                         extracted_answers = extraction.get("answers", {})
                         detected_format = extraction.get("detected_format", "Unknown")
+                        notes = extraction.get("notes", "")
 
                         # Grade against official Cambridge answer key
                         result = mcq_engine.grade_submission(
@@ -180,6 +181,7 @@ with col_right:
                             student_name=student_name.strip(),
                             detected_format=detected_format
                         )
+                        result["notes"] = notes
 
                         # Save to submissions log for teacher
                         mcq_engine.save_submission(result)
@@ -199,6 +201,8 @@ with col_right:
         g = res["grade"]
         badge_class = "grade-astar" if g == "A*" else ("grade-a" if g == "A" else ("grade-b" if g == "B" else ("grade-c" if g == "C" else "grade-lower")))
 
+        notes_disp = res.get("notes", "Standard Scanner")
+
         st.markdown(f"""
         <div class="score-card">
             <div style="font-size: 1.1rem; color: #475569; font-weight: 600;">{res['student_name']}</div>
@@ -207,7 +211,7 @@ with col_right:
             <p class="score-pct">{res['percentage']}% Score</p>
             <div class="grade-badge {badge_class}">Grade: {res['grade']}</div>
             <div style="margin-top: 0.8rem;">
-                <span class="format-tag">Detected format: {res['detected_format'].replace('_', ' ').title()}</span>
+                <span class="format-tag">Scanner v1.2: {notes_disp}</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -281,7 +285,6 @@ with st.expander("🔒 Teacher Portal (Password Protected)", expanded=False):
                 else:
                     st.error("Incorrect PIN.")
     else:
-        # Teacher is authenticated
         h_col1, h_col2 = st.columns([3, 1])
         with h_col1:
             st.subheader("📊 Teacher Dashboard — All Submissions")
