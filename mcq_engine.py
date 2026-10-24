@@ -1,8 +1,8 @@
 """
 mcq_engine.py - Core Engine for Cambridge IGCSE Physics Paper 2 (MCQ) Auto-Grader
 Supports:
-1. Circled / marked exam question papers
-2. Bubble sheets (OMR)
+1. Cambridge OMR / Bubble answer sheets (horizontal shaded lozenges under A/B/C/D)
+2. Circled / marked exam question papers
 3. Handwritten notebook paper answers (e.g., '1. A, 2. B, 3. C...')
 """
 
@@ -17,7 +17,6 @@ import pymupdf
 from google import genai
 from google.genai import types
 
-# Import API configuration from existing config.py (READ-ONLY)
 import config
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcq_data")
@@ -25,7 +24,6 @@ KEYS_FILE = os.path.join(DATA_DIR, "answer_keys.json")
 SUBMISSIONS_FILE = os.path.join(DATA_DIR, "submissions.json")
 
 # Grade boundaries for Cambridge IGCSE Physics Paper 2 (out of 40)
-# Based on historical Cambridge threshold trends
 GRADE_THRESHOLDS = [
     (34, "A*"),
     (29, "A"),
@@ -35,6 +33,18 @@ GRADE_THRESHOLDS = [
     (11, "E"),
     (0,  "U")
 ]
+
+def get_api_key() -> str:
+    """Dynamically get API key from Streamlit secrets or config."""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+            val = str(st.secrets["GEMINI_API_KEY"]).strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return getattr(config, "GEMINI_API_KEY", "").strip()
 
 def load_answer_keys() -> Dict[str, Any]:
     """Load all pre-loaded Paper 2 answer keys."""
@@ -50,23 +60,17 @@ def load_answer_keys() -> Dict[str, Any]:
 def get_exam_choices() -> List[Tuple[str, str]]:
     """Return sorted list of (paper_code, display_name) for UI dropdown."""
     keys = load_answer_keys()
-    # Sort by year descending, then session, then variant
     items = list(keys.items())
     items.sort(key=lambda x: (x[1].get("year", 0), x[1].get("paper_code", "")), reverse=True)
     return [(k, v["display_name"]) for k, v in items]
 
 def convert_files_to_images(files) -> List[Image.Image]:
-    """
-    Convert uploaded files (PDF or images) into a list of PIL Images.
-    Accepts uploaded file objects from Streamlit or raw bytes/paths.
-    """
+    """Convert uploaded files (PDF or images) into a list of PIL Images."""
     images = []
     for file_obj in files:
-        # Determine filename or name attribute
         name = getattr(file_obj, "name", "file").lower()
         if hasattr(file_obj, "read"):
             content = file_obj.read()
-            # Reset seek position if possible
             if hasattr(file_obj, "seek"):
                 file_obj.seek(0)
         elif isinstance(file_obj, (bytes, bytearray)):
@@ -79,9 +83,8 @@ def convert_files_to_images(files) -> List[Image.Image]:
             continue
 
         if name.endswith(".pdf"):
-            # Render PDF pages with PyMuPDF
             doc = pymupdf.open(stream=content, filetype="pdf")
-            zoom = 2.0  # 144-200 DPI equivalent
+            zoom = 2.0
             mat = pymupdf.Matrix(zoom, zoom)
             for page_num in range(len(doc)):
                 page = doc[page_num]
@@ -90,11 +93,9 @@ def convert_files_to_images(files) -> List[Image.Image]:
                 images.append(img)
             doc.close()
         else:
-            # Direct image file (PNG, JPG, JPEG, WEBP)
             try:
                 img = Image.open(io.BytesIO(content))
                 img = img.convert("RGB")
-                # Resize if excessively large (> 2500px in either dimension) to save bandwidth
                 max_dim = 2500
                 if img.width > max_dim or img.height > max_dim:
                     img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
@@ -115,7 +116,6 @@ def robust_json_loads(raw_text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try finding outermost JSON object
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1:
@@ -129,35 +129,51 @@ def robust_json_loads(raw_text: str) -> Dict[str, Any]:
 def extract_answers_with_vision(images: List[Image.Image], exam_title: str = "") -> Dict[str, Any]:
     """
     Send the student's answer sheet/paper images to Gemini Vision.
-    Extracts answers 1 through 40.
+    Extracts answers 1 through 40 with specialized high-resolution zoom on Cambridge OMR columns.
     """
     if not images:
         raise ValueError("No valid images provided for answer extraction.")
 
-    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    api_key = get_api_key()
+    if not api_key:
+        raise ValueError("No GEMINI_API_KEY configured. Please check config.py or Streamlit Secrets.")
 
-    prompt = f"""You are an expert Cambridge IGCSE Physics Paper 2 (Multiple Choice) examination reader.
-Your task is to examine the provided images of a student's solved exam and extract the candidate's chosen answer for every question from Question 1 through Question 40.
+    client = genai.Client(api_key=api_key)
+
+    # Check if this might be a Cambridge bubble sheet (single page format with 2 columns)
+    content_payload = []
+    
+    prompt = f"""You are an expert Cambridge IGCSE examination optical reader.
+Your task is to examine the provided images of a student's solved exam and extract the candidate's chosen answer (A, B, C, or D) for every question from Question 1 through Question 40.
 
 Target Exam: {exam_title if exam_title else "Cambridge IGCSE Physics 0625 Paper 2 (40 Questions)"}
 
-THE SUBMISSION MAY BE IN ONE OF THREE FORMATS:
-1. CIRCLED EXAM PAPER: The actual question paper where the candidate circled, boxed, underlined, or checked an option letter (A, B, C, or D).
-2. BUBBLE / OMR SHEET: A grid of questions 1-40 with shaded or filled bubbles for options A, B, C, D.
-3. HANDWRITTEN NOTEBOOK: A student notebook or paper where the student wrote numbers and letters (e.g., "1. B, 2. A, 3. C...", or two columns of answers).
+DETAILED FORMAT GUIDELINES:
+
+FORMAT 1: CAMBRIDGE SUPPLEMENTARY MULTIPLE-CHOICE ANSWER SHEET (OMR / BUBBLE SHEET)
+- Two columns: Questions 1 to 20 are in the LEFT column; Questions 21 to 40 are in the RIGHT column.
+- Each row contains letters: A B C D E F G H.
+- Directly UNDERNEATH each letter is a small horizontal rectangular box [__].
+- The candidate answers by filling or darkening the horizontal rectangular box UNDER their chosen letter (A, B, C, or D).
+- IMPORTANT: Cambridge IGCSE exams only use options A, B, C, and D. Columns E, F, G, H are unused and MUST BE IGNORED.
+- Carefully determine which letter (A, B, C, or D) has the darkened/black horizontal mark in the box directly below it.
+- If a row has NO box shaded (e.g. Question 40 is completely empty), mark it as "BLANK".
+
+FORMAT 2: CIRCLED QUESTION PAPER
+- The candidate circled, boxed, or underlined option A, B, C, or D on the question paper.
+- If an option was crossed out and another chosen, take the final intended answer.
+
+FORMAT 3: HANDWRITTEN NOTEBOOK
+- The student wrote numbers and letters (e.g. "1. B, 2. A, 3. C...").
 
 CRITICAL EXTRACTION RULES:
-- Extract an answer for EVERY question number from 1 to 40.
-- Valid answers are strictly single uppercase letters: "A", "B", "C", or "D".
-- If a question was skipped, blank, or completely omitted, write "BLANK".
-- CROSSED-OUT ANSWERS: If a student crossed out or scribbled over an answer and wrote/circled a new one, IGNORE the crossed-out answer and extract their final intended choice.
-- CIRCLED OPTION TEXT: If the student circled the text of an option rather than the letter, determine whether that text corresponds to option A, B, C, or D.
-- MULTI-COLUMN LAYOUT: In notebooks, questions are often arranged in columns (e.g. 1-20 on left, 21-40 on right). Scan all columns carefully.
+- Output an answer for EVERY question from 1 to 40.
+- Output MUST strictly be single uppercase letters: "A", "B", "C", or "D" (or "BLANK" if unattempted).
 
 OUTPUT FORMAT:
 Return strictly a valid JSON object matching this exact structure:
 {{
-  "detected_format": "circled_exam | bubble_sheet | handwritten_notebook",
+  "detected_format": "bubble_sheet | circled_exam | handwritten_notebook",
   "total_questions_detected": 40,
   "answers": {{
     "1": "A",
@@ -166,17 +182,30 @@ Return strictly a valid JSON object matching this exact structure:
     ...
     "40": "D"
   }},
-  "notes": "Any brief observation regarding unclear markings or cross-outs"
+  "notes": "Brief notes on any unclear markings"
 }}
 """
+    content_payload.append(prompt)
 
-    contents = [prompt]
-    contents.extend(images)
+    # Add images and high-resolution crops if single-page sheet
+    for img in images:
+        content_payload.append(img)
+        w, h = img.size
+        # If it looks like a full page (portrait aspect ratio), also provide close-up crops of both columns
+        if h > w and len(images) == 1:
+            try:
+                col1 = img.crop((int(w * 0.30), int(h * 0.34), int(w * 0.59), int(h * 0.91)))
+                col2 = img.crop((int(w * 0.59), int(h * 0.34), int(w * 0.88), int(h * 0.91)))
+                content_payload.append("CLOSE-UP CROP OF LEFT COLUMN (Questions 1 to 20):")
+                content_payload.append(col1)
+                content_payload.append("CLOSE-UP CROP OF RIGHT COLUMN (Questions 21 to 40):")
+                content_payload.append(col2)
+            except Exception:
+                pass
 
-    # Models to try (primary with fallback)
     models_to_try = [
         getattr(config, "DEFAULT_MODEL", "gemini-3.5-flash-lite"),
-        "gemini-2.5-flash"
+        "gemini-3.8-flash"
     ]
 
     last_err = None
@@ -184,16 +213,15 @@ Return strictly a valid JSON object matching this exact structure:
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=contents,
+                contents=content_payload,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.1
+                    temperature=0.0
                 )
             )
             raw_text = response.text
             parsed = robust_json_loads(raw_text)
 
-            # Ensure all questions 1-40 are present in the dictionary
             raw_answers = parsed.get("answers", {})
             cleaned_answers = {}
             for q in range(1, 41):
@@ -218,10 +246,7 @@ def grade_submission(
     student_name: str = "Student",
     detected_format: str = "Unknown"
 ) -> Dict[str, Any]:
-    """
-    Compare extracted student answers against official answer key.
-    Calculates marks, percentage, grade, and identifies wrong answers.
-    """
+    """Compare extracted student answers against official answer key."""
     all_keys = load_answer_keys()
     if paper_code not in all_keys:
         raise ValueError(f"Exam paper code '{paper_code}' not found in database.")
@@ -244,7 +269,6 @@ def grade_submission(
             is_correct = False
             status = "blank"
         elif correct_ans == "DISCOUNTED":
-            # Cambridge discounted question: free mark to all candidates
             score += 1
             is_correct = True
             status = "discounted"
@@ -253,7 +277,6 @@ def grade_submission(
             is_correct = True
             status = "correct"
         elif "/" in correct_ans or "OR" in correct_ans:
-            # Cambridge accepted multiple letters
             accepted = [c for c in ["A", "B", "C", "D"] if c in correct_ans]
             if student_ans in accepted:
                 score += 1
@@ -284,7 +307,6 @@ def grade_submission(
 
     percentage = round((score / 40.0) * 100.0, 1)
 
-    # Determine grade
     grade = "U"
     for min_score, g in GRADE_THRESHOLDS:
         if score >= min_score:
@@ -325,7 +347,6 @@ def save_submission(result_data: Dict[str, Any]) -> bool:
         except Exception:
             history = []
 
-    # Keep light summary record for history list
     record = {
         "id": f"sub_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{result_data.get('student_name', 'std')}",
         "timestamp": result_data.get("timestamp", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -342,7 +363,7 @@ def save_submission(result_data: Dict[str, Any]) -> bool:
         "wrong_questions": [w["question"] for w in result_data.get("wrong_answers", [])]
     }
 
-    history.insert(0, record)  # Newest first
+    history.insert(0, record)
 
     try:
         with open(SUBMISSIONS_FILE, "w", encoding="utf-8") as f:
